@@ -194,27 +194,23 @@ class AugmentedSaver():
     def save_features(self, model, fname, gen_t, num_epochs=10):
         shape = model.layers[-1].output_shape
         f = h5py.File(self.path+'results/'+fname, 'w')
-        train = f.create_dataset("train", (0,)+shape[1:], 
+        X_train, y_train = get_data_labels(self.path+'train/', 
+                                           target_size=self.target_size)
+        f.create_dataset("train_labels", data=y_train, compression="gzip")
+        train = f.create_dataset("train_features", (0,)+shape[1:], 
                                 maxshape=shape, compression="gzip")
         for i in range(num_epochs):
-            datagen = gen_t.flow_from_directory(self.path+'train/', 
-                                                target_size=self.target_size, 
-                                                batch_size=self.batch_size,
-                                                shuffle=False)
+            datagen = gen_t.flow(X_train, y_train, self.batch_size, shuffle=False)
             conv_trn_feat = model.predict_generator(datagen, val_samples=self.train_size)
             train.resize(train.shape[0]+self.train_size, axis=0)
             train[-self.train_size:,] = conv_trn_feat
 
-        valid = f.create_dataset("valid", (0,)+shape[1:], 
-                                maxshape=shape, compression="gzip")
+        X_val, y_val = get_data_labels(self.path+'valid/', target_size=self.target_size)
+        f.create_dataset("val_labels", data=y_val, compression="gzip")
         gen = image.ImageDataGenerator()
-        datagen = gen.flow_from_directory(self.path+'valid/', 
-                                          target_size=self.target_size, 
-                                          batch_size=self.batch_size,
-                                          shuffle=False)
+        datagen = gen.flow(X_val, y_val, self.batch_size, shuffle=False)
         conv_val_feat = model.predict_generator(datagen, val_samples=self.valid_size)
-        valid.resize(valid.shape[0]+self.valid_size, axis=0)
-        valid[-self.valid_size:,] = conv_val_feat
+        f.create_dataset("val_features", data=conv_val_feat, compression="gzip")
 
 def mk_size(img, r2c):
     r,c,_ = img.shape
