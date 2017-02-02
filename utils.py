@@ -204,6 +204,7 @@ class AugmentedSaver():
             conv_trn_feat = model.predict_generator(datagen, val_samples=self.train_size)
             train.resize(train.shape[0]+self.train_size, axis=0)
             train[-self.train_size:,] = conv_trn_feat
+        del X_train, y_train, conv_trn_feat
 
         X_val, y_val = get_data_labels(self.path+'valid/', target_size=self.target_size)
         f.create_dataset("val_labels", data=y_val, compression="gzip")
@@ -211,6 +212,7 @@ class AugmentedSaver():
         datagen = gen.flow(X_val, y_val, self.batch_size, shuffle=False)
         conv_val_feat = model.predict_generator(datagen, val_samples=self.valid_size)
         f.create_dataset("val_features", data=conv_val_feat, compression="gzip")
+        del X_val, y_val, conv_val_feat
 
 def mk_size(img, r2c):
     r,c,_ = img.shape
