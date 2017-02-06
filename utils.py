@@ -5,8 +5,8 @@ from glob import glob
 import numpy as np
 from matplotlib import pyplot as plt
 from operator import itemgetter, attrgetter, methodcaller
-from collections import OrderedDict
-import threading
+from collections import OrderedDict, deque
+from threading import *
 import itertools
 from itertools import chain
 
@@ -187,7 +187,7 @@ def load_array_partial(fname, start=0, end=1000):
 class HDF5Iterator():
 
     def __init__(self, x, y, image_data_generator,
-                 batch_size=64, shuffle=False, seed=None,
+                 batch_size=64, shuffle=True, seed=None,
                  image_mode=False, dim_ordering='default'):
         if (image_mode is False) and (image_data_generator is not None):
             raise ValueError('image_data_generator can be not None '
@@ -217,6 +217,7 @@ class HDF5Iterator():
                 self.image_shape = x.shape[3:]+x.shape[1:3]
         else:
             self.image_shape = x.shape[1:]
+        self.shuffle = shuffle
         self.x = x
         self.image_mode = image_mode
         if len(self.x.shape) != 4:
@@ -226,31 +227,69 @@ class HDF5Iterator():
         self.image_data_generator = image_data_generator
         self.dim_ordering = dim_ordering
         self.batch_size = batch_size
+        self.n = train_size
         self.index_generator = self.flow_indices(train_size, label_size)
+        self.q = deque(maxlen=100)
+        self.t = Thread(target=self.prefetch)
+        self.t.start()
 
-    def flow_indices(self, train_size, label_size):
-        # ensure self.batch_index is 0
-        current_index = 0
+    def batchwise_sort(self, index_array, train_size, label_size):
+        start = 0
         batch_size = self.batch_size
         while 1:
-            aux_index = current_index % label_size
+            aux_index = start % label_size
             if label_size >= aux_index + batch_size:
                 current_batch_size = batch_size
             elif((aux_index < label_size) and 
                  (label_size < aux_index + batch_size)):
                 current_batch_size = label_size - aux_index
-            yield (current_index, current_batch_size)
-            current_index = (current_index + current_batch_size) % train_size
+            stop = start+current_batch_size
+            index_array[start:stop] = np.sort(index_array[start:stop])
+            start = stop%train_size
+            if(start==0):
+                break
+
+    def flow_indices(self, train_size, label_size):
+        # ensure self.batch_index is 0
+        start = 0
+        index_array = np.arange(train_size)
+        if(self.shuffle):
+            index_array = np.random.permutation(train_size)
+            self.batchwise_sort(index_array, train_size, label_size)
+        batch_size = self.batch_size
+        while 1:
+            aux_index = start % label_size
+            if label_size >= aux_index + batch_size:
+                current_batch_size = batch_size
+            elif((aux_index < label_size) and 
+                 (label_size < aux_index + batch_size)):
+                current_batch_size = label_size - aux_index
+            stop = start + current_batch_size
+            yield (index_array[start: stop],
+                start, current_batch_size)
+            start = (start + current_batch_size) % train_size
+
+    def prefetch(self):
+        while(True):
+            index_array, _, _ = next(self.index_generator)
+            temp_x = self.x[index_array,:]
+            if self.y is None:
+                self.q.append((temp_x,))
+            else:
+                epoch_size = self.y.shape[0]
+                index_array = np.remainder(index_array, epoch_size)
+                temp_y = self.y[index_array,:]
+                self.q.append((temp_x, temp_y))
+            print(len(self.q))
 
     def next(self):
-        current_index, current_batch_size = next(self.index_generator)
-        start = current_index
-        stop = current_index+current_batch_size
-        temp_x = np.zeros((current_batch_size,)+self.x.shape[1:])
-        self.x.read_direct(temp_x, source_sel=np.s_[start:stop], dest_sel=np.s_[:])
+        print("In next")
+        pair = self.q.popleft()
+        print(len(self.q))
+        temp_x = pair[0]
         if(self.image_mode):
             batch_x = np.zeros((current_batch_size,) + self.image_shape)
-            for i in range(current_batch_size): 
+            for i,j in enumerate(index_array): 
                 x = image.img_to_array(temp_x[i], 
                                        dim_ordering=self.dim_ordering)
                 x = self.image_data_generator.random_transform(x.astype('float32'))
@@ -260,19 +299,14 @@ class HDF5Iterator():
             batch_x = temp_x
         if self.y is None:
             return batch_x
-        epoch_size = self.y.shape[0]
-        current_index = current_index%epoch_size
-        start = current_index
-        stop = current_index+current_batch_size
-        batch_y = np.zeros((current_batch_size,)+self.y.shape[1:])
-        self.y.read_direct(batch_y, source_sel=np.s_[start:stop], dest_sel=np.s_[:])
+        batch_y = pair[1]
         return batch_x, batch_y
 
-def flow_from_hdf5(X, y=None, gen=None, batch_size=64, seed=None, image_mode=False):
+def flow_from_hdf5(X, y=None, gen=None, batch_size=64, seed=None, image_mode=False, shuffle=True):
     return HDF5Iterator(
         X, y, gen,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
         seed=seed,
         image_mode=image_mode,
         dim_ordering='default')
@@ -316,9 +350,11 @@ class FeatureSaver():
         data_shape = model.layers[-1].output_shape
         label_shape = (None,)+self.nb_classes
 
-        feat_dset = f.create_dataset('train_features', (0,)+data_shape[1:], 
+        feat_dset = f.create_dataset('train_features', 
+                                     (0,)+data_shape[1:], 
                                      maxshape=data_shape)
-        label_dset = f.create_dataset('train_labels', (0,)+label_shape[1:], 
+        label_dset = f.create_dataset('train_labels', 
+                                      (0,)+label_shape[1:], 
                                       maxshape=label_shape)
         self.save_labels(datagen, label_dset)
         for i in range(num_epochs):
