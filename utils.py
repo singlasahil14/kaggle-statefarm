@@ -6,6 +6,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 from operator import itemgetter, attrgetter, methodcaller
 from collections import OrderedDict
+import threading
 import itertools
 from itertools import chain
 
@@ -20,7 +21,7 @@ from scipy import misc, ndimage
 from scipy.ndimage.interpolation import zoom
 from scipy.ndimage import imread
 from sklearn.metrics import confusion_matrix
-import bcolz
+#import bcolz
 import h5py
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.manifold import TSNE
@@ -183,18 +184,226 @@ def load_array_partial(fname, start=0, end=1000):
     c=bcolz.open(fname)
     return c[start:end]
 
-class AugmentedSaver():
+class HDF5Iterator():
+
+    def __init__(self, x, y, image_data_generator,
+                 batch_size=64, shuffle=False, seed=None,
+                 image_mode=False, dim_ordering='default'):
+        if (image_mode is False) and (image_data_generator is not None):
+            raise ValueError('image_data_generator can be not None '
+                             'only if image_mode is True')
+        if y is not None and ((len(x)%len(y)) !=0):
+            raise ValueError('X (images tensor) should have length an '
+                             'integer multiple of y (labels). '
+                             'Found: X.shape = %s, y.shape = %s' %
+                             (np.asarray(x).shape, np.asarray(y).shape))
+        train_size = len(x)
+        if y is not None:
+            self.y = y
+            label_size = len(y)
+        else:
+            self.y = None
+            label_size = train_size
+        if (batch_size >= label_size):
+            raise ValueError('batch_size should be less than epoch size ')
+        if dim_ordering == 'default':
+            dim_ordering = K.image_dim_ordering()
+        if(image_mode):
+            if(image_data_generator is None):
+                image_data_generator = image.ImageDataGenerator()
+            if(dim_ordering=='tf'):
+                self.image_shape = x.shape[1:]
+            else:
+                self.image_shape = x.shape[3:]+x.shape[1:3]
+        else:
+            self.image_shape = x.shape[1:]
+        self.x = x
+        self.image_mode = image_mode
+        if len(self.x.shape) != 4:
+            raise ValueError('Input data in `HDF5Iterator` '
+                             'should have rank 4. You passed an array '
+                             'with shape', self.x.shape)
+        self.image_data_generator = image_data_generator
+        self.dim_ordering = dim_ordering
+        self.batch_size = batch_size
+        self.index_generator = self.flow_indices(train_size, label_size)
+
+    def flow_indices(self, train_size, label_size):
+        # ensure self.batch_index is 0
+        current_index = 0
+        batch_size = self.batch_size
+        while 1:
+            aux_index = current_index % label_size
+            if label_size >= aux_index + batch_size:
+                current_batch_size = batch_size
+            elif((aux_index < label_size) and 
+                 (label_size < aux_index + batch_size)):
+                current_batch_size = label_size - aux_index
+            yield (current_index, current_batch_size)
+            current_index = (current_index + current_batch_size) % train_size
+
+    def next(self):
+        current_index, current_batch_size = next(self.index_generator)
+        start = current_index
+        stop = current_index+current_batch_size
+        temp_x = np.zeros((current_batch_size,)+self.x.shape[1:])
+        self.x.read_direct(temp_x, source_sel=np.s_[start:stop], dest_sel=np.s_[:])
+        if(self.image_mode):
+            batch_x = np.zeros((current_batch_size,) + self.image_shape)
+            for i in range(current_batch_size): 
+                x = image.img_to_array(temp_x[i], 
+                                       dim_ordering=self.dim_ordering)
+                x = self.image_data_generator.random_transform(x.astype('float32'))
+                x = self.image_data_generator.standardize(x)
+                batch_x[i] = x
+        else:
+            batch_x = temp_x
+        if self.y is None:
+            return batch_x
+        epoch_size = self.y.shape[0]
+        current_index = current_index%epoch_size
+        start = current_index
+        stop = current_index+current_batch_size
+        batch_y = np.zeros((current_batch_size,)+self.y.shape[1:])
+        self.y.read_direct(batch_y, source_sel=np.s_[start:stop], dest_sel=np.s_[:])
+        return batch_x, batch_y
+
+def flow_from_hdf5(X, y=None, gen=None, batch_size=64, seed=None, image_mode=False):
+    return HDF5Iterator(
+        X, y, gen,
+        batch_size=batch_size,
+        shuffle=False,
+        seed=seed,
+        image_mode=image_mode,
+        dim_ordering='default')
+
+class FeatureSaver():
+    def __init__(self, train_datagen, valid_datagen=None, test_datagen=None):
+        self.train_datagen = train_datagen
+        self.valid_datagen = valid_datagen
+        self.test_datagen = test_datagen
+        self.nb_classes = self.get_nb_classes()
+    
+    def get_nb_classes(self):
+         class_name = self.train_datagen.__class__.__name__
+         if(class_name=='DirectoryIterator'):
+             return (self.train_datagen.nb_class,)
+         else:
+             return self.train_datagen.y.shape[1:]
+
+    def run_epoch(self, datagen, model, feat_dset):
+        i = 0
+        while i < datagen.n:
+           data, labels = datagen.next()
+           curr_size = len(data)
+           features = model.predict_on_batch(data)
+           feat_dset.resize(feat_dset.shape[0]+curr_size, axis=0)
+           feat_dset[-curr_size:,] = features
+           i = i + curr_size
+
+    def save_labels(self, datagen, label_dset):
+        i = 0
+        while i < datagen.n:
+            data, labels = datagen.next()
+            curr_size = len(labels)
+            label_dset.resize(label_dset.shape[0]+curr_size, axis=0)
+            label_dset[-curr_size:,] = labels
+            i = i + curr_size
+
+    def save_train(self, model, f, num_epochs=10):
+        datagen = self.train_datagen
+
+        data_shape = model.layers[-1].output_shape
+        label_shape = (None,)+self.nb_classes
+
+        feat_dset = f.create_dataset('train_features', (0,)+data_shape[1:], 
+                                     maxshape=data_shape)
+        label_dset = f.create_dataset('train_labels', (0,)+label_shape[1:], 
+                                      maxshape=label_shape)
+        self.save_labels(datagen, label_dset)
+        for i in range(num_epochs):
+            self.run_epoch(datagen, model, feat_dset)
+
+    def save_valid(self, model, f):
+        datagen = self.valid_datagen
+
+        data_shape = model.layers[-1].output_shape
+        label_shape = (None,)+self.nb_classes
+        feat_dset = f.create_dataset('valid_features', (0,)+data_shape[1:], 
+                                     maxshape=data_shape)
+        label_dset = f.create_dataset('valid_labels', (0,)+label_shape[1:], 
+                                      maxshape=label_shape)
+        self.save_labels(datagen, label_dset)
+        self.run_epoch(datagen, model, feat_dset)
+
+    def save_test(self, model, f):
+        datagen = self.test_datagen
+
+        data_shape = model.layers[-1].output_shape
+        label_shape = (None,)+self.nb_classes
+        feat_dset = f.create_dataset('test_features', (0,)+data_shape[1:], 
+                                     maxshape=data_shape)
+        label_dset = f.create_dataset('test_labels', (0,)+label_shape[1:], 
+                                      maxshape=label_shape)
+        self.run_epoch(datagen, model, feat_dset)
+
+class DataSaver():
     def __init__(self, path_folder, batch_size=64, target_size=(224,224)):
         self.path = path_folder
+        self.train_path = self.path+'train/'
+        self.val_path = self.path+'valid/'
+        self.results_path = self.path+'results/'
+
         self.batch_size = batch_size
         self.target_size = target_size
-        self.train_size = len(glob(self.path+'train/*/*'))
-        self.valid_size = len(glob(self.path+'valid/*/*'))
+
+        self.train_size = len(glob(self.train_path+'*/*'))
+        self.valid_size = len(glob(self.val_path+'*/*'))
+
+    def save_images(self, f, split_name='train'):
+        gen = image.ImageDataGenerator(dim_ordering='tf')
+        path_name = self.path+split_name+'/'
+        datagen = gen.flow_from_directory(path_name, 
+                                          target_size=self.target_size,
+                                          batch_size=self.batch_size, 
+                                          shuffle=False)
+        data_shape = (None,)+datagen.image_shape
+        label_shape = (None,)+(datagen.nb_class,)
+        data_dset = f.create_dataset(split_name+'_data', (0,)+data_shape[1:], 
+                                     maxshape=data_shape)
+        label_dset = f.create_dataset(split_name+'_labels', 
+                                      (0,)+label_shape[1:], 
+                                      maxshape=label_shape)
+        i = 0
+        while i < datagen.nb_sample:
+            data, labels = datagen.next()
+            curr_size = len(labels)
+            data_dset.resize(data_dset.shape[0]+curr_size, axis=0)
+            data_dset[-curr_size:,] = data
+            if(split_name!='test'):
+                label_dset.resize(label_dset.shape[0]+curr_size, axis=0)
+                label_dset[-curr_size:,] = labels
+            i = i + curr_size
+
+    def save_train(self, fname='dataset.h5'):
+        f = h5py.File(self.path+'results/'+fname, 'w')
+        self.save_images(f, split_name='train')
+
+    def save_trainval(self, fname='dataset.h5'):
+        f = h5py.File(self.path+'results/'+fname, 'w')
+        self.save_images(f, split_name='train')
+        self.save_images(f, split_name='valid')
+
+    def save_all(self, fname='dataset.h5'):
+        f = h5py.File(self.path+'results/'+fname, 'w')
+        self.save_images(f, split_name='train')
+        self.save_images(f, split_name='valid')
+        self.save_images(f, split_name='test')
 
     def save_features(self, model, fname, gen_t, num_epochs=10):
         shape = model.layers[-1].output_shape
-        f = h5py.File(self.path+'results/'+fname, 'w')
-        X_train, y_train = get_data_labels(self.path+'train/', 
+        f = h5py.File(self.results_path+fname, 'w')
+        X_train, y_train = get_data_labels(self.train_path, 
                                            target_size=self.target_size)
         f.create_dataset("train_labels", data=y_train, compression="gzip")
         train = f.create_dataset("train_features", (0,)+shape[1:], 
@@ -206,7 +415,7 @@ class AugmentedSaver():
             train[-self.train_size:,] = conv_trn_feat
         del X_train, y_train, conv_trn_feat
 
-        X_val, y_val = get_data_labels(self.path+'valid/', target_size=self.target_size)
+        X_val, y_val = get_data_labels(self.val_path, target_size=self.target_size)
         f.create_dataset("val_labels", data=y_val, compression="gzip")
         gen = image.ImageDataGenerator()
         datagen = gen.flow(X_val, y_val, self.batch_size, shuffle=False)
