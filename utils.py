@@ -7,6 +7,7 @@ from matplotlib import pyplot as plt
 from operator import itemgetter, attrgetter, methodcaller
 from collections import OrderedDict
 import itertools
+import shutil
 from itertools import chain
 
 import pandas as pd
@@ -198,6 +199,17 @@ def create_arrays(f, names, shapes):
         dsets.append(f.create_dataset(name, (0,)+shape[1:], maxshape=(None,)+shape[1:]))
     return tuple(dsets)
 
+def gen_batches(feat, labels, batch_size=32, epoch_size=None):
+    if epoch_size is None:
+        epoch_size = len(labels)
+    start = 0
+    while True:
+        epoch_start = start % epoch_size
+        curr_size = min(batch_size, epoch_size - epoch_start)
+        stop = min(start + curr_size, len(labels))
+        yield feat[start:stop], labels[start:stop]
+        start = stop % (len(labels))
+
 def get_batches(datagen):
     batch_size = datagen.batch_size
     for i in range(0, datagen.n, batch_size):
@@ -255,8 +267,9 @@ class FeatureSaver():
         self.run_epoch(datagen, model, feat_dset)
 
 class DataSaver():
-    def __init__(self, path_folder, gen=image.ImageDataGenerator(), 
-                batch_size=64, target_size=(224,224)):
+    def __init__(self, path_folder, 
+                 gen=image.ImageDataGenerator(dim_ordering="tf"), 
+                 batch_size=64, target_size=(224,224)):
         self.path = path_folder
         self.gen = gen
         self.results_path = self.path+'results/'
@@ -269,7 +282,7 @@ class DataSaver():
             if(split_name=='train'):
                 gen = self.gen
             else:
-                gen = image.ImageDataGenerator()
+                gen = image.ImageDataGenerator(dim_ordering="tf")
             path_name = self.path+split_name+'/'
             datagen = gen.flow_from_directory(path_name, 
                                               target_size=self.target_size,
